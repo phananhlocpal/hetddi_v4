@@ -5,6 +5,7 @@ import torch.nn as nn
 import numpy as np
 import argparse
 from model.HetDDI import HetDDI
+from model.AdvanceHetDDI import AdvanceHetDDI
 from utils.data_loader import load_data, get_train_test
 from train_test import train_one_epoch, test
 from utils.pytorchtools import EarlyStopping
@@ -67,17 +68,30 @@ def run(args):
             test_y = torch.from_numpy(test_y).float()
 
         # load model
-        if args.label_type == 'multi_class':
-            model = HetDDI(kg_g, smiles, args.hidden_dim, args.num_layer, args.mode, 86, args.condition).to(device)
-            loss_func = nn.CrossEntropyLoss()
-        elif args.label_type == 'binary_class':
-            model = HetDDI(kg_g, smiles, args.hidden_dim, args.num_layer, args.mode, 1, args.condition).to(device)
-            loss_func = nn.BCEWithLogitsLoss()
-        elif args.label_type == 'multi_label':
-            model = HetDDI(kg_g, smiles, args.hidden_dim, args.num_layer, args.mode, 200, args.condition).to(device)
-            loss_func = nn.BCEWithLogitsLoss()
-        if i == 0:
-            print(model)
+        if args.model == 'HetDDI':
+            if args.label_type == 'multi_class':
+                model = HetDDI(kg_g, smiles, args.hidden_dim, args.num_layer, args.mode, 86, args.condition).to(device)
+                loss_func = nn.CrossEntropyLoss()
+            elif args.label_type == 'binary_class':
+                model = HetDDI(kg_g, smiles, args.hidden_dim, args.num_layer, args.mode, 1, args.condition).to(device)
+                loss_func = nn.BCEWithLogitsLoss()
+            elif args.label_type == 'multi_label':
+                model = HetDDI(kg_g, smiles, args.hidden_dim, args.num_layer, args.mode, 200, args.condition).to(device)
+                loss_func = nn.BCEWithLogitsLoss()
+            if i == 0:
+                print(model)
+        elif args.model == 'AdvanceHetDDI':
+            if args.label_type == 'multi_class':
+                model = AdvanceHetDDI(kg_g, smiles, args.hidden_dim, args.num_layer, args.mode, 86, args.condition).to(device)
+                loss_func = nn.CrossEntropyLoss()
+            elif args.label_type == 'binary_class':
+                model = AdvanceHetDDI(kg_g, smiles, args.hidden_dim, args.num_layer, args.mode, 1, args.condition).to(device)
+                loss_func = nn.BCEWithLogitsLoss()
+            elif args.label_type == 'multi_label':
+                model = AdvanceHetDDI(kg_g, smiles, args.hidden_dim, args.num_layer, args.mode, 200, args.condition).to(device)
+                loss_func = nn.BCEWithLogitsLoss()
+            if i == 0:
+                print(model)
 
         # divide parameters into two parts, weight_p has l2_norm but bias_bn_emb_p not
         weight_p, bias_bn_emb_p = [], []
@@ -159,6 +173,7 @@ if __name__ == '__main__':
     ap.add_argument('--kg_name', type=str, default='DRKG')
     ap.add_argument('--ddi_name', type=str, choices=['DrugBank', "TWOSIDES"], default='DrugBank')
     ap.add_argument('--device', type=str, choices=['auto', 'cuda', 'cpu'], default='auto')
+    ap.add_argument('--model', type=str, choices=['HetDDI', 'AdvanceHetDDI'], default='HetDDI')
 
     args = ap.parse_args(args=[])
     print(args)
