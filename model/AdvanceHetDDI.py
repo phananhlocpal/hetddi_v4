@@ -1,511 +1,332 @@
-"""
-AdvancedHetDDI — Drug-Drug Interaction Prediction
-====================================================
-Improvements over HetDDI:
-  1. Graph Transformer  : Transformer-style attention over molecular graphs
-  2. KG Transformer     : Relational attention over the knowledge graph
-  3. Contrastive Pre-training : InfoNCE loss on augmented molecular views
-  4. Cross-modal Attention Fusion : Attend SMILES ↔ KG embeddings per drug
-  5. Bilinear Interaction Predictor : F_A^T W F_B instead of plain MLP concat
-
-Pipeline (per forward pass):
-  SMILES  ──► Graph Transformer  ──► S_A / S_B        (molecular embedding)
-  KG      ──► KG Transformer     ──► G_A / G_B        (biological embedding)
-  S_A+G_A ──► Cross Attention    ──► F_A              (fused embedding)
-  S_B+G_B ──► Cross Attention    ──► F_B
-  F_A, F_B ──► Bilinear Head     ──► logits           (interaction score)
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import dgl
-from dgl.nn import GATv2Conv
-from dgl import DGLGraph
-from typing import Optional
+from model.hgnn import HGNN
+from model.mol import Mol
 
 
-# ─────────────────────────────────────────────
-# 1. Graph Transformer  (molecular graph)
-# ─────────────────────────────────────────────
-
-class GraphTransformerLayer(nn.Module):
-    """
-    Single Graph Transformer layer.
-    Uses multi-head attention between atom nodes (GATv2)
-    followed by a Feed-Forward Network + LayerNorm.
-    """
-
-    def __init__(self, hidden: int, num_heads: int = 4, dropout: float = 0.1):
+# ---------------------------------------------------------------------------
+# Co-attention đơn giản hơn — không dùng gate phức tạp
+# Giữ lại residual chuẩn, thêm FFN sau attention (như Transformer block)
+# ---------------------------------------------------------------------------
+class CoAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
-        assert hidden % num_heads == 0
-        self.attn = GATv2Conv(
-            in_feats=hidden,
-            out_feats=hidden // num_heads,
-            num_heads=num_heads,
-            feat_drop=dropout,
-            attn_drop=dropout,
-            activation=None,
-            share_weights=False,
+        self.attn_a2b = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.attn_b2a = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm_a1 = nn.LayerNorm(dim)
+        self.norm_b1 = nn.LayerNorm(dim)
+        self.norm_a2 = nn.LayerNorm(dim)
+        self.norm_b2 = nn.LayerNorm(dim)
+        # FFN sau attention — giúp transform features sau khi đã cross-attend
+        self.ffn_a = nn.Sequential(
+            nn.Linear(dim, dim * 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(dim * 2, dim), nn.Dropout(dropout)
         )
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden, hidden * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden * 2, hidden),
+        self.ffn_b = nn.Sequential(
+            nn.Linear(dim, dim * 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(dim * 2, dim), nn.Dropout(dropout)
         )
-        self.norm1 = nn.LayerNorm(hidden)
-        self.norm2 = nn.LayerNorm(hidden)
-        self.drop  = nn.Dropout(dropout)
 
-    def forward(self, g: DGLGraph, h: torch.Tensor) -> torch.Tensor:
-        # Multi-head attention  [N, heads, head_dim] → [N, hidden]
-        h_attn = self.attn(g, h).flatten(1)
-        h = self.norm1(h + self.drop(h_attn))
-        h = self.norm2(h + self.drop(self.ffn(h)))
-        return h
+    def forward(self, a: torch.Tensor, b: torch.Tensor):
+        a_seq = a.unsqueeze(1)
+        b_seq = b.unsqueeze(1)
+        # Cross-attention + residual + layernorm (Pre-LN style)
+        a_ctx, _ = self.attn_a2b(self.norm_a1(a_seq), self.norm_b1(b_seq), self.norm_b1(b_seq))
+        b_ctx, _ = self.attn_b2a(self.norm_b1(b_seq), self.norm_a1(a_seq), self.norm_a1(a_seq))
+        a = a + a_ctx.squeeze(1)
+        b = b + b_ctx.squeeze(1)
+        # FFN + residual
+        a = a + self.ffn_a(self.norm_a2(a))
+        b = b + self.ffn_b(self.norm_b2(b))
+        return a, b
 
 
-class MolGraphTransformer(nn.Module):
-    """
-    Stacks multiple GraphTransformerLayers then mean-pools atoms
-    to produce a single drug embedding S ∈ R^hidden.
-    """
-
-    def __init__(
-        self,
-        atom_in_feats: int,
-        hidden: int,
-        num_layers: int = 3,
-        num_heads: int = 4,
-        dropout: float = 0.1,
-    ):
+# ---------------------------------------------------------------------------
+# Prototype memory — giữ nguyên từ v1, fix init
+# ---------------------------------------------------------------------------
+class PrototypeMemory(nn.Module):
+    def __init__(self, dim: int, class_num: int):
         super().__init__()
-        self.input_proj = nn.Linear(atom_in_feats, hidden)
-        self.layers = nn.ModuleList(
-            [GraphTransformerLayer(hidden, num_heads, dropout) for _ in range(num_layers)]
-        )
-        self.pool_norm = nn.LayerNorm(hidden)
+        self.prototypes = nn.Parameter(torch.empty(class_num, dim))
+        nn.init.xavier_uniform_(self.prototypes)
+        self.dim = dim
+        self.class_num = class_num
 
-    def forward(self, g: DGLGraph, atom_feats: torch.Tensor) -> torch.Tensor:
-        """
-        g          : batched DGLGraph of molecular graphs
-        atom_feats : [total_atoms, atom_in_feats]
-        returns    : [num_graphs, hidden]
-        """
-        h = self.input_proj(atom_feats)
-        for layer in self.layers:
-            h = layer(g, h)
-        # Mean pooling over atoms per molecule
-        g.ndata['h'] = h
-        emb = dgl.mean_nodes(g, 'h')
-        return self.pool_norm(emb)
+    def forward(self, pair_emb: torch.Tensor) -> torch.Tensor:
+        pair_norm = F.normalize(pair_emb, dim=-1)
+        proto_norm = F.normalize(self.prototypes, dim=-1)
+        sim = pair_norm @ proto_norm.t()
+        weights = F.softmax(sim / 0.1, dim=-1)
+        return weights @ self.prototypes
 
-
-# ─────────────────────────────────────────────
-# 2. KG Transformer  (relational knowledge graph)
-# ─────────────────────────────────────────────
-
-class RelationalGraphTransformerLayer(nn.Module):
-    """
-    Relational Graph Transformer layer.
-    Projects each relation type into a separate key/value transform
-    so that 'inhibits', 'metabolized_by', 'treats', etc. are handled
-    with relation-specific weights.
-    """
-
-    def __init__(
-        self,
-        hidden: int,
-        num_relations: int,
-        num_heads: int = 4,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        assert hidden % num_heads == 0
-        self.num_heads  = num_heads
-        self.head_dim   = hidden // num_heads
-        self.hidden     = hidden
-
-        self.q_proj = nn.Linear(hidden, hidden)
-        # Per-relation key and value projections
-        self.k_proj = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(num_relations)])
-        self.v_proj = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(num_relations)])
-        self.out_proj = nn.Linear(hidden, hidden)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden, hidden * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden * 2, hidden),
-        )
-        self.norm1 = nn.LayerNorm(hidden)
-        self.norm2 = nn.LayerNorm(hidden)
-        self.drop  = nn.Dropout(dropout)
-        self.scale = self.head_dim ** -0.5
-
-    def forward(
-        self,
-        node_feats: torch.Tensor,        # [N, hidden]
-        edge_index: torch.Tensor,        # [2, E]  (src, dst)
-        edge_type:  torch.Tensor,        # [E]     relation id
-    ) -> torch.Tensor:
-        N, H = node_feats.shape
-        n_heads, head_dim = self.num_heads, self.head_dim
-
-        Q = self.q_proj(node_feats).view(N, n_heads, head_dim)
-
-        # Aggregate neighbour messages per node
-        agg = torch.zeros_like(node_feats)          # [N, H]
-        cnt = torch.zeros(N, 1, device=node_feats.device)
-
-        for rel_id, (k_lin, v_lin) in enumerate(zip(self.k_proj, self.v_proj)):
-            mask = edge_type == rel_id
+    @torch.no_grad()
+    def update_prototype(self, pair_emb: torch.Tensor, labels: torch.Tensor, momentum: float = 0.99):
+        for c in range(self.class_num):
+            mask = (labels == c)
             if mask.sum() == 0:
                 continue
-            src = edge_index[0][mask]
-            dst = edge_index[1][mask]
-
-            K_r = k_lin(node_feats[src]).view(-1, n_heads, head_dim)  # [E_r, heads, d]
-            V_r = v_lin(node_feats[src]).view(-1, n_heads, head_dim)
-
-            # Attention score  [E_r, heads]
-            attn = (Q[dst] * K_r).sum(-1) * self.scale
-            attn = F.softmax(attn, dim=0)                             # softmax over edges per dst
-
-            # Weighted value  [E_r, hidden]
-            msg = (attn.unsqueeze(-1) * V_r).reshape(-1, H)
-
-            agg.index_add_(0, dst, msg)
-            cnt.index_add_(0, dst, torch.ones(mask.sum(), 1, device=cnt.device))
-
-        cnt = cnt.clamp(min=1)
-        agg = self.out_proj(agg / cnt)
-
-        node_feats = self.norm1(node_feats + self.drop(agg))
-        node_feats = self.norm2(node_feats + self.drop(self.ffn(node_feats)))
-        return node_feats
+            mean_emb = pair_emb[mask].mean(0)
+            self.prototypes.data[c] = (
+                momentum * self.prototypes.data[c] + (1 - momentum) * mean_emb
+            )
 
 
-class KGTransformer(nn.Module):
-    """
-    Encodes the entire knowledge graph; returns embeddings for all nodes.
-    Drug node embeddings are extracted by index after encoding.
-    """
+# ---------------------------------------------------------------------------
+# InfoNCE
+# ---------------------------------------------------------------------------
+class InfoNCELoss(nn.Module):
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.tau = temperature
 
+    def forward(self, mol_emb: torch.Tensor, kg_emb: torch.Tensor) -> torch.Tensor:
+        B = mol_emb.size(0)
+        z1 = F.normalize(mol_emb, dim=-1)
+        z2 = F.normalize(kg_emb, dim=-1)
+        logits = z1 @ z2.t() / self.tau
+        labels = torch.arange(B, device=z1.device)
+        return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)) / 2
+
+
+# ---------------------------------------------------------------------------
+# AdvancedHetDDI v3
+#
+# Thay đổi so với v2:
+# 1. Bỏ Focal Loss — dùng lại CrossEntropy + label_smoothing nhẹ (0.05)
+#    Focal Loss làm train loss giảm quá nhanh → overfit
+# 2. Co-attention dùng Pre-LN + FFN thay vì gate phức tạp
+#    Pre-LN ổn định hơn trong training, FFN giúp transform sau cross-attend
+# 3. Bỏ symmetric pair (a+b, a*b) — quay về concat(a,b)
+#    a*b tạo gradient instability với embedding lớn
+# 4. Thêm Mixup augmentation trong pair embedding space
+#    Giúp model generalize tốt hơn với unseen drug pairs (s2/s3)
+# 5. Decoder dùng 4 layer thay vì 3, với residual connection
+#    Tăng capacity mà không tăng width → ít overfit hơn
+# ---------------------------------------------------------------------------
+class AdvancedHetDDI(nn.Module):
     def __init__(
         self,
-        node_in_feats: int,
-        hidden: int,
-        num_relations: int,
-        num_layers: int = 2,
-        num_heads: int = 4,
+        kg_g,
+        smiles,
+        num_hidden: int,
+        num_layer: int,
+        mode: str,
+        class_num: int,
+        condition: str,
+        num_attn_heads: int = 4,
+        contrastive_temp: float = 0.07,
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.input_proj = nn.Linear(node_in_feats, hidden)
-        self.layers = nn.ModuleList([
-            RelationalGraphTransformerLayer(hidden, num_relations, num_heads, dropout)
-            for _ in range(num_layers)
+
+        self.smiles = smiles
+        self.device = kg_g.device
+        self.mode = mode
+        self.drug_num = len(smiles)
+        self.class_num = class_num
+        self.num_hidden = num_hidden
+
+        # ---- KG encoder ----
+        if mode in ('only_kg', 'concat'):
+            self.kg = HGNN(
+                kg_g, kg_g.edata['edges'], kg_g.ndata['nodes'],
+                num_hidden, num_layer=num_layer
+            )
+            self.kg_size = self.kg.get_output_size()
+            self.kg_fc = self._make_fc(self.kg_size, dropout)
+
+        # ---- Mol encoder ----
+        if mode in ('only_mol', 'concat'):
+            self.mol = Mol(smiles, num_hidden, num_layer, self.device, condition)
+            self.mol_size = self.mol.gnn.get_output_size()
+            self.mol_fc = self._make_fc(self.mol_size, dropout)
+
+        # ---- Mol projection (contrastive + KG fallback) ----
+        if mode == 'concat':
+            self.mol_proj = nn.Sequential(
+                nn.Linear(self.mol_size, self.kg_size),
+                nn.LayerNorm(self.kg_size),
+                nn.ReLU(),
+                nn.Linear(self.kg_size, self.kg_size),
+            )
+
+        # ---- Single drug dim ----
+        if mode == 'only_kg':
+            single_dim = self.kg_size
+        elif mode == 'only_mol':
+            single_dim = self.mol_size
+        else:
+            single_dim = self.kg_size + self.mol_size
+
+        # ---- Co-attention ----
+        self.co_attn = CoAttention(single_dim, num_heads=num_attn_heads, dropout=dropout)
+
+        # ---- Pair dim: concat(a, b) ----
+        pair_dim = single_dim * 2
+
+        # ---- Prototype memory ----
+        self.proto_mem = PrototypeMemory(pair_dim, class_num)
+
+        # ---- Decoder với residual connections ----
+        # Input: pair_emb (pair_dim) + proto_feat (pair_dim) = pair_dim*2
+        decoder_in = pair_dim * 2
+        hidden = decoder_in // 2
+
+        self.dec_proj = nn.Linear(decoder_in, hidden)  # project xuống trước
+        self.dec_layers = nn.ModuleList([
+            self._make_dec_block(hidden, dropout),
+            self._make_dec_block(hidden, dropout),
+            self._make_dec_block(hidden, dropout),
         ])
-        self.norm = nn.LayerNorm(hidden)
+        self.dec_head = nn.Linear(hidden, class_num, bias=False)
 
-    def forward(
-        self,
-        node_feats: torch.Tensor,   # [N_kg, node_in_feats]
-        edge_index: torch.Tensor,   # [2, E]
-        edge_type:  torch.Tensor,   # [E]
-    ) -> torch.Tensor:
-        h = self.input_proj(node_feats)
-        for layer in self.layers:
-            h = layer(h, edge_index, edge_type)
-        return self.norm(h)                 # [N_kg, hidden]
+        # ---- Contrastive ----
+        self.contrastive_weight = 0.05
+        self.contrastive_loss_fn = InfoNCELoss(temperature=contrastive_temp)
 
-
-# ─────────────────────────────────────────────
-# 3. Contrastive Pre-training (InfoNCE)
-# ─────────────────────────────────────────────
-
-class MolecularAugmenter:
-    """
-    Two stochastic views of a molecular graph:
-      - view1: randomly drop drop_rate fraction of edges
-      - view2: independently drop drop_rate fraction of edges
-    """
-
-    def __init__(self, drop_rate: float = 0.10):
-        self.drop_rate = drop_rate
-
-    def __call__(self, g: DGLGraph):
-        """Returns two augmented DGLGraph copies."""
-        return self._drop_edges(g), self._drop_edges(g)
-
-    def _drop_edges(self, g: DGLGraph) -> DGLGraph:
-        num_edges = g.num_edges()
-        mask = torch.rand(num_edges, device=g.device) > self.drop_rate
-        eids  = torch.where(mask)[0]
-        return dgl.edge_subgraph(g, eids, relabel_nodes=False, store_ids=False)
-
-
-def contrastive_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
-    """
-    InfoNCE / NT-Xent loss.
-    z1, z2 : [B, D]  — two views of the same molecule
-    Diagonal entries are positive pairs; off-diagonal are negatives.
-    """
-    B = z1.size(0)
-    z1 = F.normalize(z1, dim=-1)
-    z2 = F.normalize(z2, dim=-1)
-    sim = torch.mm(z1, z2.T) / temperature          # [B, B]
-    labels = torch.arange(B, device=z1.device)
-    loss = (F.cross_entropy(sim, labels) + F.cross_entropy(sim.T, labels)) / 2
-    return loss
-
-
-# ─────────────────────────────────────────────
-# 4. Cross-modal Attention Fusion
-# ─────────────────────────────────────────────
-
-class CrossModalAttentionFusion(nn.Module):
-    """
-    Fuses molecular embedding S and KG embedding G for one drug.
-
-    Mechanism:
-        Query  = S   (structural view)
-        Key    = G   (biological view)
-        Value  = G
-
-    Output F = concat( S , Attention(S→G) ) projected to hidden.
-    """
-
-    def __init__(self, hidden: int, num_heads: int = 4, dropout: float = 0.1):
-        super().__init__()
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=hidden,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
+        # ---- KG known mask ----
+        self.register_buffer(
+            'kg_known_mask',
+            torch.ones(len(smiles), dtype=torch.bool)
         )
-        self.proj = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
-            nn.LayerNorm(hidden),
-            nn.GELU(),
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _make_fc(dim: int, dropout: float) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(dim, dim), nn.BatchNorm1d(dim), nn.Dropout(dropout), nn.ReLU(),
+            nn.Linear(dim, dim), nn.BatchNorm1d(dim), nn.Dropout(dropout), nn.ReLU(),
+            nn.Linear(dim, dim), nn.BatchNorm1d(dim), nn.Dropout(dropout), nn.ReLU(),
         )
-        self.norm = nn.LayerNorm(hidden)
 
-    def forward(self, S: torch.Tensor, G: torch.Tensor) -> torch.Tensor:
-        """
-        S : [B, hidden]  molecular embedding
-        G : [B, hidden]  KG embedding
-        returns F : [B, hidden]
-        """
-        # Unsqueeze seq dim  → [B, 1, hidden]
-        S_seq = S.unsqueeze(1)
-        G_seq = G.unsqueeze(1)
+    @staticmethod
+    def _make_dec_block(dim: int, dropout: float) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.BatchNorm1d(dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
 
-        attended, _ = self.cross_attn(query=S_seq, key=G_seq, value=G_seq)
-        attended = attended.squeeze(1)                        # [B, hidden]
+    # ------------------------------------------------------------------
+    def _get_drug_emb(self, drug_indices: torch.Tensor) -> torch.Tensor:
+        if self.mode == 'only_mol':
+            return self._mol_emb[drug_indices]
+        elif self.mode == 'only_kg':
+            return self._kg_emb[drug_indices]
+        else:
+            mol_emb = self._mol_emb[drug_indices]
+            mol_projected = self.mol_proj(mol_emb)
+            known = self.kg_known_mask[drug_indices]
+            kg_selected = self._kg_emb[drug_indices]
+            kg_final = torch.where(
+                known.unsqueeze(-1).expand_as(kg_selected),
+                kg_selected,
+                mol_projected.detach(),
+            )
+            return torch.cat([kg_final, mol_emb], dim=-1)
 
-        # Residual + concat fusion
-        fused = self.proj(torch.cat([S, attended], dim=-1))   # [B, hidden]
-        return self.norm(fused + S)                           # residual from S
+    # ------------------------------------------------------------------
+    def _cache_embeddings(self):
+        if self.mode in ('only_kg', 'concat'):
+            self._kg_emb = self.kg_fc(self.kg()[:self.drug_num])
+        if self.mode in ('only_mol', 'concat'):
+            self._mol_emb = self.mol_fc(self.mol())
 
+    # ------------------------------------------------------------------
+    def _decode(self, x: torch.Tensor) -> torch.Tensor:
+        """Decoder với residual connections."""
+        h = self.dec_proj(x)
+        for layer in self.dec_layers:
+            h = h + layer(h)   # residual
+        return self.dec_head(h)
 
-# ─────────────────────────────────────────────
-# 5. Bilinear Interaction Predictor
-# ─────────────────────────────────────────────
-
-class BilinearInteractionHead(nn.Module):
-    """
-    score = F_A^T W F_B
-    where W ∈ R^{hidden × hidden × class_num} is a rank-decomposed bilinear tensor.
-
-    For multi-class DDI we use a separate W_k per class (low-rank factorisation).
-    """
-
-    def __init__(self, hidden: int, class_num: int, rank: int = 32, dropout: float = 0.1):
-        super().__init__()
-        # Low-rank factorisation: W_k ≈ U_k V_k^T
-        self.U = nn.Parameter(torch.empty(class_num, hidden, rank))
-        self.V = nn.Parameter(torch.empty(class_num, hidden, rank))
-        nn.init.xavier_uniform_(self.U)
-        nn.init.xavier_uniform_(self.V)
-        self.bias = nn.Parameter(torch.zeros(class_num))
-        self.drop  = nn.Dropout(dropout)
-
-    def forward(self, F_A: torch.Tensor, F_B: torch.Tensor) -> torch.Tensor:
-        """
-        F_A, F_B : [B, hidden]
-        returns   : [B, class_num]
-        """
-        # Project each drug into rank space per class
-        # U : [C, H, R]  F_A : [B, H]
-        # a_k = F_A @ U_k  → [B, R]
-        a = torch.einsum('bh, chr -> bcr', self.drop(F_A), self.U)   # [B, C, R]
-        b = torch.einsum('bh, chr -> bcr', self.drop(F_B), self.V)   # [B, C, R]
-
-        # score_k = sum_r a_k * b_k
-        scores = (a * b).sum(-1) + self.bias                          # [B, C]
-        return scores
-
-
-# ─────────────────────────────────────────────
-# 6. AdvancedHetDDI  (main model)
-# ─────────────────────────────────────────────
-
-class AdvancedHetDDI(nn.Module):
-    """
-    AdvancedHetDDI
-    ==============
-    Args
-    ----
-    mol_graphs     : pre-built DGL batched molecular graph with atom features
-                     stored in g.ndata['atom_feat']  [total_atoms, atom_in_feats]
-    kg_node_feats  : Tensor [N_kg, node_in_feats]  — initial KG node features
-    kg_edge_index  : Tensor [2, E]                 — KG edges (src, dst)
-    kg_edge_type   : Tensor [E]                    — relation id per edge
-    drug_node_ids  : LongTensor [num_drugs]        — which KG node indices are drugs
-    atom_in_feats  : int
-    node_in_feats  : int
-    hidden         : int
-    num_mol_layers : int
-    num_kg_layers  : int
-    num_relations  : int
-    class_num      : int   (1 for binary, >1 for typed DDI)
-    num_heads      : int
-    bilinear_rank  : int   (rank for low-rank bilinear decomposition)
-    dropout        : float
-    """
-
-    def __init__(
+    # ------------------------------------------------------------------
+    def _mixup_pair(
         self,
-        mol_graphs:      DGLGraph,
-        kg_node_feats:   torch.Tensor,
-        kg_edge_index:   torch.Tensor,
-        kg_edge_type:    torch.Tensor,
-        drug_node_ids:   torch.Tensor,
-        atom_in_feats:   int,
-        node_in_feats:   int,
-        hidden:          int   = 256,
-        num_mol_layers:  int   = 3,
-        num_kg_layers:   int   = 2,
-        num_relations:   int   = 10,
-        class_num:       int   = 1,
-        num_heads:       int   = 4,
-        bilinear_rank:   int   = 32,
-        dropout:         float = 0.1,
+        pair_emb: torch.Tensor,
+        labels: torch.Tensor,
+        alpha: float = 0.2,
     ):
-        super().__init__()
-
-        # ── stored tensors ──────────────────────────────────────────────
-        self.register_buffer('kg_node_feats', kg_node_feats)
-        self.register_buffer('kg_edge_index', kg_edge_index)
-        self.register_buffer('kg_edge_type',  kg_edge_type)
-        self.register_buffer('drug_node_ids', drug_node_ids)
-        self.mol_graphs = mol_graphs          # DGLGraph (batched molecules)
-        self.class_num  = class_num
-
-        # ── 1. Molecular Graph Transformer ──────────────────────────────
-        self.mol_encoder = MolGraphTransformer(
-            atom_in_feats=atom_in_feats,
-            hidden=hidden,
-            num_layers=num_mol_layers,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
-
-        # ── 2. KG Transformer ───────────────────────────────────────────
-        self.kg_encoder = KGTransformer(
-            node_in_feats=node_in_feats,
-            hidden=hidden,
-            num_relations=num_relations,
-            num_layers=num_kg_layers,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
-
-        # ── 3. Contrastive pre-training components ───────────────────────
-        self.augmenter = MolecularAugmenter(drop_rate=0.10)
-        self.proj_head = nn.Sequential(           # projection for InfoNCE
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden // 2),
-        )
-
-        # ── 4. Cross-modal Attention Fusion ─────────────────────────────
-        self.fusion = CrossModalAttentionFusion(
-            hidden=hidden,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
-
-        # ── 5. Bilinear Interaction Predictor ────────────────────────────
-        self.predictor = BilinearInteractionHead(
-            hidden=hidden,
-            class_num=max(class_num, 1),
-            rank=bilinear_rank,
-            dropout=dropout,
-        )
-
-    # ── helpers ─────────────────────────────────────────────────────────
-
-    def _encode_mol(self, g: Optional[DGLGraph] = None) -> torch.Tensor:
-        """Returns [num_drugs, hidden] molecular embeddings."""
-        graph = g if g is not None else self.mol_graphs
-        atom_feats = graph.ndata['atom_feat']
-        return self.mol_encoder(graph, atom_feats)       # [num_drugs, hidden]
-
-    def _encode_kg(self) -> torch.Tensor:
-        """Returns [num_drugs, hidden] KG embeddings for drug nodes."""
-        all_emb = self.kg_encoder(
-            self.kg_node_feats, self.kg_edge_index, self.kg_edge_type
-        )                                                # [N_kg, hidden]
-        return all_emb[self.drug_node_ids]               # [num_drugs, hidden]
-
-    # ── contrastive pre-training step ───────────────────────────────────
-
-    def contrastive_step(self) -> torch.Tensor:
         """
-        Call this during pre-training.
-        Returns InfoNCE loss over all drugs in mol_graphs.
+        Mixup trong pair embedding space.
+        Trộn 2 sample ngẫu nhiên với lam ~ Beta(alpha, alpha).
+        Chỉ dùng khi training.
+        Trả về (mixed_pair_emb, mixed_labels_soft).
         """
-        g1, g2 = self.augmenter(self.mol_graphs)
-        z1 = self.proj_head(self._encode_mol(g1))
-        z2 = self.proj_head(self._encode_mol(g2))
-        return contrastive_loss(z1, z2)
+        B = pair_emb.size(0)
+        lam = torch.distributions.Beta(alpha, alpha).sample().to(pair_emb.device)
+        idx = torch.randperm(B, device=pair_emb.device)
 
-    # ── main forward ────────────────────────────────────────────────────
+        mixed_emb = lam * pair_emb + (1 - lam) * pair_emb[idx]
 
+        # Soft labels: one-hot trộn
+        if labels.dim() == 1:
+            labels_oh = F.one_hot(labels, self.class_num).float()
+        else:
+            labels_oh = labels.float()
+        mixed_labels = lam * labels_oh + (1 - lam) * labels_oh[idx]
+
+        return mixed_emb, mixed_labels
+
+    # ------------------------------------------------------------------
     def forward(
         self,
-        left:  torch.LongTensor,   # [B]  drug indices for drug A
-        right: torch.LongTensor,   # [B]  drug indices for drug B
-    ) -> torch.Tensor:
-        """
-        Returns logits [B] (binary) or [B, class_num] (typed DDI).
+        left: torch.Tensor,
+        right: torch.Tensor,
+        labels: torch.Tensor = None,
+        return_contrastive: bool = False,
+        use_mixup: bool = False,
+    ):
+        self._cache_embeddings()
 
-        Pipeline:
-          SMILES → mol_encoder  → S             [num_drugs, H]
-          KG     → kg_encoder   → G             [num_drugs, H]
-          S+G    → fusion       → F             [num_drugs, H]
-          F_A, F_B → predictor  → logits        [B (, C)]
-        """
-        # ── encode ──────────────────────────────────────────────────────
-        S = self._encode_mol()           # [num_drugs, hidden]
-        G = self._encode_kg()            # [num_drugs, hidden]
+        left_emb = self._get_drug_emb(left)
+        right_emb = self._get_drug_emb(right)
 
-        # ── fuse per drug ────────────────────────────────────────────────
-        # fusion expects batch dimension → process all drugs at once
-        F_all = self.fusion(S, G)        # [num_drugs, hidden]
+        # Co-attention
+        left_emb, right_emb = self.co_attn(left_emb, right_emb)
 
-        # ── select drug pairs ────────────────────────────────────────────
-        F_A = F_all[left]               # [B, hidden]
-        F_B = F_all[right]              # [B, hidden]
+        # Pair embedding: simple concat
+        pair_emb = torch.cat([left_emb, right_emb], dim=-1)
 
-        # ── predict interaction ──────────────────────────────────────────
-        logits = self.predictor(F_A, F_B)   # [B, C]
+        # Prototype EMA update
+        if self.training and labels is not None:
+            label_idx = labels.argmax(dim=-1) if labels.dim() > 1 else labels
+            self.proto_mem.update_prototype(pair_emb.detach(), label_idx)
 
-        if self.class_num == 1:
-            return logits.squeeze(-1)        # [B]
-        return logits                        # [B, C]
+        # Mixup augmentation (optional, chỉ training)
+        mixed_labels = None
+        if self.training and use_mixup and labels is not None:
+            pair_emb, mixed_labels = self._mixup_pair(pair_emb, labels)
 
+        # Prototype feature
+        proto_feat = self.proto_mem(pair_emb)
+
+        # Decode
+        decoder_input = torch.cat([pair_emb, proto_feat], dim=-1)
+        logits = self._decode(decoder_input)
+
+        if not return_contrastive:
+            if mixed_labels is not None:
+                return logits, mixed_labels
+            return logits
+
+        # Contrastive loss
+        contrastive_loss = torch.tensor(0.0, device=self.device)
+        if self.mode == 'concat':
+            all_indices = torch.cat([left, right]).unique()
+            known = self.kg_known_mask[all_indices]
+            if known.sum() > 1:
+                known_idx = all_indices[known]
+                mol_z = self.mol_proj(self._mol_emb[known_idx])
+                kg_z = self._kg_emb[known_idx]
+                contrastive_loss = self.contrastive_loss_fn(mol_z, kg_z)
+
+        if mixed_labels is not None:
+            return logits, contrastive_loss, mixed_labels
+        return logits, contrastive_loss
+
+    # ------------------------------------------------------------------
+    def mark_unseen_drugs(self, unseen_indices: list):
+        self.kg_known_mask[unseen_indices] = False

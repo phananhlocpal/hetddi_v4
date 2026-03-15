@@ -1,0 +1,174 @@
+running on cuda:0
+HierDDI(
+  (kg): HGNN(
+    (dropout): Dropout(p=0.2, inplace=False)
+    (node_embedding): Embedding(97244, 300)
+    (gat_layers): ModuleList(
+      (0-2): 3 x HetConv(
+        (edge_embedding): Embedding(108, 300)
+        (bn): Sequential(
+          (0): Linear(in_features=300, out_features=300, bias=True)
+          (1): BatchNorm1d(300, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        )
+        (leaky_relu): LeakyReLU(negative_slope=0.02)
+      )
+    )
+  )
+  (kg_fc): Sequential(
+    (0): Linear(in_features=300, out_features=300, bias=True)
+    (1): BatchNorm1d(300, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (2): Dropout(p=0.1, inplace=False)
+    (3): ReLU()
+    (4): Linear(in_features=300, out_features=300, bias=True)
+    (5): BatchNorm1d(300, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (6): Dropout(p=0.1, inplace=False)
+    (7): ReLU()
+    (8): Linear(in_features=300, out_features=300, bias=True)
+    (9): BatchNorm1d(300, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (10): Dropout(p=0.1, inplace=False)
+    (11): ReLU()
+  )
+  (mol): Mol(
+    (readout): AvgPooling()
+    (gnn): HGNN(
+      (dropout): Dropout(p=0.2, inplace=False)
+      (node_embedding): Embedding(89, 300)
+      (gat_layers): ModuleList(
+        (0-2): 3 x HetConv(
+          (edge_embedding): Embedding(5, 300)
+          (bn): Sequential(
+            (0): Linear(in_features=300, out_features=300, bias=True)
+            (1): BatchNorm1d(300, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          )
+          (leaky_relu): LeakyReLU(negative_slope=0.02)
+        )
+      )
+    )
+  )
+  (mol_fc): Sequential(
+    (0): Linear(in_features=300, out_features=300, bias=True)
+    (1): BatchNorm1d(300, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (2): Dropout(p=0.1, inplace=False)
+    (3): ReLU()
+    (4): Linear(in_features=300, out_features=300, bias=True)
+    (5): BatchNorm1d(300, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (6): Dropout(p=0.1, inplace=False)
+    (7): ReLU()
+    (8): Linear(in_features=300, out_features=300, bias=True)
+    (9): BatchNorm1d(300, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+    (10): Dropout(p=0.1, inplace=False)
+    (11): ReLU()
+  )
+  (dis_enc): DisentangledEncoder(
+    (struct_proj): Sequential(
+      (0): Linear(in_features=300, out_features=300, bias=True)
+      (1): LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+      (2): ReLU()
+      (3): Linear(in_features=300, out_features=300, bias=True)
+      (4): LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+    )
+    (ctx_proj): Sequential(
+      (0): Linear(in_features=300, out_features=300, bias=True)
+      (1): LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+      (2): ReLU()
+      (3): Linear(in_features=300, out_features=300, bias=True)
+      (4): LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+    )
+    (fusion): Sequential(
+      (0): Linear(in_features=600, out_features=300, bias=True)
+      (1): LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+      (2): ReLU()
+      (3): Dropout(p=0.1, inplace=False)
+    )
+  )
+  (iga): InteractionGraphAttention(
+    (init_interact): Sequential(
+      (0): Linear(in_features=600, out_features=300, bias=True)
+      (1): LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+      (2): ReLU()
+    )
+    (attn_ab2i): ModuleList(
+      (0-1): 2 x MultiheadAttention(
+        (out_proj): NonDynamicallyQuantizableLinear(in_features=300, out_features=300, bias=True)
+      )
+    )
+    (attn_i2a): ModuleList(
+      (0-1): 2 x MultiheadAttention(
+        (out_proj): NonDynamicallyQuantizableLinear(in_features=300, out_features=300, bias=True)
+      )
+    )
+    (attn_i2b): ModuleList(
+      (0-1): 2 x MultiheadAttention(
+        (out_proj): NonDynamicallyQuantizableLinear(in_features=300, out_features=300, bias=True)
+      )
+    )
+    (norm_a): ModuleList(
+      (0-1): 2 x LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+    )
+    (norm_b): ModuleList(
+      (0-1): 2 x LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+    )
+    (norm_i): ModuleList(
+      (0-1): 2 x LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+    )
+    (ffn_a): ModuleList(
+      (0-1): 2 x Sequential(
+        (0): Linear(in_features=300, out_features=600, bias=True)
+        (1): GELU(approximate='none')
+        (2): Dropout(p=0.1, inplace=False)
+        (3): Linear(in_features=600, out_features=300, bias=True)
+        (4): Dropout(p=0.1, inplace=False)
+      )
+    )
+    (ffn_b): ModuleList(
+      (0-1): 2 x Sequential(
+        (0): Linear(in_features=300, out_features=600, bias=True)
+        (1): GELU(approximate='none')
+        (2): Dropout(p=0.1, inplace=False)
+        (3): Linear(in_features=600, out_features=300, bias=True)
+        (4): Dropout(p=0.1, inplace=False)
+      )
+    )
+    (ffn_i): ModuleList(
+      (0-1): 2 x Sequential(
+        (0): Linear(in_features=300, out_features=600, bias=True)
+        (1): GELU(approximate='none')
+        (2): Dropout(p=0.1, inplace=False)
+        (3): Linear(in_features=600, out_features=300, bias=True)
+        (4): Dropout(p=0.1, inplace=False)
+      )
+    )
+    (norm_a2): ModuleList(
+      (0-1): 2 x LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+    )
+    (norm_b2): ModuleList(
+      (0-1): 2 x LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+    )
+    (norm_i2): ModuleList(
+      (0-1): 2 x LayerNorm((300,), eps=1e-05, elementwise_affine=True)
+    )
+  )
+  (hier_proto): HierarchicalPrototypeTree(
+    (query_proj): Sequential(
+      (0): Linear(in_features=900, out_features=900, bias=True)
+      (1): LayerNorm((900,), eps=1e-05, elementwise_affine=True)
+      (2): ReLU()
+      (3): Linear(in_features=900, out_features=900, bias=True)
+    )
+  )
+  (dec_proj): Linear(in_features=1800, out_features=900, bias=True)
+  (dec_layers): ModuleList(
+    (0-2): 3 x Sequential(
+      (0): Linear(in_features=900, out_features=900, bias=True)
+      (1): BatchNorm1d(900, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+      (2): ReLU()
+      (3): Dropout(p=0.1, inplace=False)
+    )
+  )
+  (dec_head): Linear(in_features=900, out_features=86, bias=False)
+  (dis_loss_fn): DisentanglementLoss(
+    (nce): InfoNCELoss()
+  )
+  (ncm_loss_fn): InfoNCELoss()
+)
+[Fold 0] class_weights: min=0.00 max=5.00

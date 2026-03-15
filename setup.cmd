@@ -60,6 +60,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
+python -m pip install torch_scatter -f https://data.pyg.org/whl/torch-2.3.0+cu121.html
+if errorlevel 1 (
+    echo ERROR: Failed to install torch_scatter
+    exit /b 1
+)
+
 python -m pip install --upgrade torchdata==0.7.1
 if errorlevel 1 (
     echo ERROR: Failed to install compatible torchdata version
@@ -81,5 +87,9 @@ if errorlevel 1 (
 
 echo.
 echo Setup complete.
-echo Activate environment with: .venv\Scripts\activate
+echo Continue to activate environment with: .venv\Scripts\activate
+
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+.venv\Scripts\activate
+
 exit /b 0
