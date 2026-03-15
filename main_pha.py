@@ -105,7 +105,9 @@ def build_model(args, kg_g, smiles, class_num, device):
         mode=args.mode, class_num=class_num, condition=args.condition,
     )
     if args.model == 'PharmaEnhancedHetDDI':
-        model = PharmaEnhancedHetDDI(**common).to(device)
+        model = PharmaEnhancedHetDDI(**common, num_attn_heads=4,
+        contrastive_temp=0.07,
+        dropout=0.1,).to(device)
     else:
         model = AdvancedHetDDI(**common).to(device)
 
