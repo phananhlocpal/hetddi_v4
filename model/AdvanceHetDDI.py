@@ -6,40 +6,47 @@ from model.mol import Mol
 
 
 # ---------------------------------------------------------------------------
-# Co-attention đơn giản hơn — không dùng gate phức tạp
-# Giữ lại residual chuẩn, thêm FFN sau attention (như Transformer block)
+# DrugPairEncoder
+# Thay thế CoAttention (seq_len=1 MHA thực chất chỉ là linear transform).
+# Xây dựng pair representation phong phú hơn:
+#   1. Explicit interaction terms: |a-b|, a*b  (symmetric inductive bias)
+#   2. Bilinear term: học asymmetric interaction giữa hai drug
+#   3. FFN + LayerNorm cuối để transform
+#   4. Compress về single_dim để giữ decoder gọn
 # ---------------------------------------------------------------------------
-class CoAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1):
+class DrugPairEncoder(nn.Module):
+    def __init__(self, dim: int, dropout: float = 0.1):
         super().__init__()
-        self.attn_a2b = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
-        self.attn_b2a = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
-        self.norm_a1 = nn.LayerNorm(dim)
-        self.norm_b1 = nn.LayerNorm(dim)
-        self.norm_a2 = nn.LayerNorm(dim)
-        self.norm_b2 = nn.LayerNorm(dim)
-        # FFN sau attention — giúp transform features sau khi đã cross-attend
-        self.ffn_a = nn.Sequential(
-            nn.Linear(dim, dim * 2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(dim * 2, dim), nn.Dropout(dropout)
+        self.norm_a = nn.LayerNorm(dim)
+        self.norm_b = nn.LayerNorm(dim)
+        # Bilinear học asymmetric cross-drug interaction
+        self.bilinear = nn.Bilinear(dim, dim, dim)
+        # FFN trên raw 4D concat
+        self.ffn = nn.Sequential(
+            nn.Linear(dim * 4, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim * 4),
         )
-        self.ffn_b = nn.Sequential(
-            nn.Linear(dim, dim * 2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(dim * 2, dim), nn.Dropout(dropout)
+        self.out_norm = nn.LayerNorm(dim * 4)
+        # Compress về dim để giữ decoder gọn
+        self.compress = nn.Sequential(
+            nn.Linear(dim * 4 + dim, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
 
-    def forward(self, a: torch.Tensor, b: torch.Tensor):
-        a_seq = a.unsqueeze(1)
-        b_seq = b.unsqueeze(1)
-        # Cross-attention + residual + layernorm (Pre-LN style)
-        a_ctx, _ = self.attn_a2b(self.norm_a1(a_seq), self.norm_b1(b_seq), self.norm_b1(b_seq))
-        b_ctx, _ = self.attn_b2a(self.norm_b1(b_seq), self.norm_a1(a_seq), self.norm_a1(a_seq))
-        a = a + a_ctx.squeeze(1)
-        b = b + b_ctx.squeeze(1)
-        # FFN + residual
-        a = a + self.ffn_a(self.norm_a2(a))
-        b = b + self.ffn_b(self.norm_b2(b))
-        return a, b
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        a_n = self.norm_a(a)
+        b_n = self.norm_b(b)
+        # Explicit symmetric interaction terms
+        raw = torch.cat([a_n, b_n, torch.abs(a_n - b_n), a_n * b_n], dim=-1)  # [B, 4D]
+        raw = self.out_norm(raw + self.ffn(raw))
+        # Bilinear asymmetric term
+        bilin = self.bilinear(a_n, b_n)  # [B, D]
+        # Merge và compress
+        return self.compress(torch.cat([raw, bilin], dim=-1))  # [B, D]
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +64,7 @@ class PrototypeMemory(nn.Module):
         pair_norm = F.normalize(pair_emb, dim=-1)
         proto_norm = F.normalize(self.prototypes, dim=-1)
         sim = pair_norm @ proto_norm.t()
-        weights = F.softmax(sim / 0.1, dim=-1)
+        weights = F.softmax(sim / 0.5, dim=-1)  # τ=0.5: softer than 0.1, richer prototype blend
         return weights @ self.prototypes
 
     @torch.no_grad()
@@ -159,11 +166,11 @@ class AdvancedHetDDI(nn.Module):
         else:
             single_dim = self.kg_size + self.mol_size
 
-        # ---- Co-attention ----
-        self.co_attn = CoAttention(single_dim, num_heads=num_attn_heads, dropout=dropout)
+        # ---- Drug pair encoder (replaces seq_len=1 CoAttention) ----
+        self.pair_encoder = DrugPairEncoder(single_dim, dropout=dropout)
 
-        # ---- Pair dim: concat(a, b) ----
-        pair_dim = single_dim * 2
+        # ---- Pair dim: DrugPairEncoder compresses to single_dim ----
+        pair_dim = single_dim
 
         # ---- Prototype memory ----
         self.proto_mem = PrototypeMemory(pair_dim, class_num)
@@ -194,10 +201,12 @@ class AdvancedHetDDI(nn.Module):
     # ------------------------------------------------------------------
     @staticmethod
     def _make_fc(dim: int, dropout: float) -> nn.Sequential:
+        # 1 layer + LayerNorm: ổn định hơn BN với batch nhỏ, ít overfit hơn 3 layers
         return nn.Sequential(
-            nn.Linear(dim, dim), nn.BatchNorm1d(dim), nn.Dropout(dropout), nn.ReLU(),
-            nn.Linear(dim, dim), nn.BatchNorm1d(dim), nn.Dropout(dropout), nn.ReLU(),
-            nn.Linear(dim, dim), nn.BatchNorm1d(dim), nn.Dropout(dropout), nn.ReLU(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
         )
 
     @staticmethod
@@ -225,7 +234,8 @@ class AdvancedHetDDI(nn.Module):
                 kg_selected,
                 mol_projected.detach(),
             )
-            return torch.cat([kg_final, mol_emb], dim=-1)
+            mol_aligned = self.mol_proj(mol_emb)  # mol → kg space trước khi concat
+            return torch.cat([kg_final, mol_aligned], dim=-1)
 
     # ------------------------------------------------------------------
     def _cache_embeddings(self):
@@ -284,11 +294,8 @@ class AdvancedHetDDI(nn.Module):
         left_emb = self._get_drug_emb(left)
         right_emb = self._get_drug_emb(right)
 
-        # Co-attention
-        left_emb, right_emb = self.co_attn(left_emb, right_emb)
-
-        # Pair embedding: simple concat
-        pair_emb = torch.cat([left_emb, right_emb], dim=-1)
+        # Drug pair encoding: [a, b, |a-b|, a*b] + bilinear + compress
+        pair_emb = self.pair_encoder(left_emb, right_emb)
 
         # Prototype EMA update
         if self.training and labels is not None:

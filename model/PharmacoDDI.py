@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from model.hgnn import HGNN
-from model.mol import Mol
+from model.advancemol import Mol
 from model.AdvanceHetDDI import CoAttention, PrototypeMemory, InfoNCELoss
 
 try:
